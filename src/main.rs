@@ -5,14 +5,14 @@ mod unfeature;
 use unfeature::unfeature;
 
 fn main() {
-    let usage = r"Usage: <input> <output> <known_features> <enabled_features>\n\
-        \n\
-        Remove all known features that are not enabled.\n\
-        \n\
-        <input>: Path to the input file\n\
-        <output>: Path to the output file\n\
-        <known_features>: Regex which matches all features that should be visited\n\
-        <enabled_features>: Comma-separated list of enabled features\n\";
+    let usage = r"Usage: <input> <output> <known_features> <enabled_features>
+
+    Remove all known features that are not enabled.
+
+    <input>: Path to the input file
+    <output>: Path to the output file
+    <known_features>: Regex which matches all features that should be visited
+    <enabled_features>: Comma-separated list of enabled features";
     let args = args().collect::<Vec<String>>();
     if args.len() != 5 {
         eprintln!("{}", usage);
