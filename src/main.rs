@@ -1,42 +1,334 @@
+use std::collections::HashMap;
+use std::iter::FromIterator;
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::{collections::HashSet, env::args, path::Path};
+use std::{collections::HashSet, path::Path};
 
+use cargo_manifest::Manifest;
+use cargo_metadata::{CargoOpt, MetadataCommand, Package, PackageId, Resolve, TargetKind};
+
+use clap::Parser;
+use error::Error;
+use log::{debug, error, info};
 use regex::Regex;
+mod error;
 mod unfeature;
-use unfeature::unfeature;
+
+/// Generate new crate with inlined enabled/disabled features
+#[derive(Debug, Parser)]
+struct Args {
+    /// Has to be "unfeature"
+    command: String,
+    /// Output directory
+    output: PathBuf,
+    /// Regex to match features
+    match_features: Regex,
+    /// Additional files to copy
+    additional_files: Vec<PathBuf>,
+    /// Enabled features
+    #[clap(short = 'F', long)]
+    features: Vec<String>,
+    /// Disable default features
+    #[clap(long)]
+    no_default_features: bool,
+    /// Enable all features
+    #[clap(long)]
+    all_features: bool,
+    /// Path to Cargo.toml
+    #[clap(long)]
+    manifest_path: Option<PathBuf>,
+}
 
 fn main() -> ExitCode {
-    let usage = r"Usage: <input> <output> <match_features> <enabled_features>
+    let Args {
+        command,
+        output,
+        match_features,
+        additional_files,
+        features,
+        no_default_features,
+        all_features,
+        manifest_path,
+    } = Args::parse();
 
-    Remove all known features that are not enabled.
+    env_logger::builder().format_timestamp(None).init();
 
-    <input>: Path to the input file
-    <output>: Path to the output file
-    <match_features>: Regex which matches all features that should be visited
-    <enabled_features>: Comma-separated list of enabled features";
-    let args = args().collect::<Vec<String>>();
-    if args.len() != 5 {
-        eprintln!("{usage}");
+    if command != "unfeature" {
+        error!("Invalid command: {}", command);
+        error!("This tool is expected to be executed by cargo: cargo unfeature");
         return ExitCode::FAILURE;
     }
-    let input = Path::new(&args[1]);
-    if !input.exists() {
-        eprintln!("Input file does not exist: {}", input.display());
-        return ExitCode::FAILURE;
+
+    info!("match: {match_features:?}");
+
+    let mut meta_cmd = MetadataCommand::new();
+    if let Some(manifest_path) = manifest_path {
+        meta_cmd.manifest_path(manifest_path);
     }
-    let output = Path::new(&args[2]);
-    let Ok(known_features) = Regex::new(&args[3]) else {
-        eprintln!("Invalid regex: {}", &args[3]);
-        return ExitCode::FAILURE;
-    };
-    let enabled_features = args[4]
-        .split(',')
-        .map(ToString::to_string)
-        .collect::<HashSet<String>>();
+    if all_features {
+        meta_cmd.features(CargoOpt::AllFeatures);
+    }
+    if no_default_features {
+        meta_cmd.features(CargoOpt::NoDefaultFeatures);
+    }
+    if features.len() > 0 {
+        meta_cmd.features(CargoOpt::SomeFeatures(features));
+    }
+    let meta = meta_cmd.exec().expect("Failed to get metadata");
 
-    let input = std::fs::read_to_string(input).unwrap();
+    info!("{:?}", meta.workspace_default_members);
 
-    let code = unfeature(&input, known_features, enabled_features).expect("Failed to parse input");
-    std::fs::write(output, code).expect("Failed to write output");
+    let resolve = meta.resolve.expect("Failed to get resolve");
+    info!("{:?}", resolve.root);
+    let root_id = resolve.root.clone().expect("Failed to get root node");
+
+    let root = meta.workspace_root.as_std_path();
+
+    unfeature_crate(
+        root,
+        &output,
+        root_id,
+        &resolve,
+        &meta.packages,
+        &match_features,
+    )
+    .unwrap();
+
+    for file in additional_files {
+        let file = file.canonicalize().unwrap();
+        let dest_path = output.join(&file.strip_prefix(root).unwrap());
+        info!("Copy: {:?} -> {dest_path:?}", file.strip_prefix(root).unwrap());
+        std::fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
+        std::fs::copy(&file, dest_path).unwrap();
+    }
+
     ExitCode::SUCCESS
+}
+
+fn unfeature_crate(
+    root: &Path,
+    destination: &Path,
+    id: PackageId,
+    resolve: &Resolve,
+    packages: &[Package],
+    match_features: &Regex,
+) -> Result<(), Error> {
+    let node = resolve
+        .nodes
+        .iter()
+        .find(|node| node.id == id)
+        .expect("Failed to find node");
+    let package = packages
+        .iter()
+        .find(|pkg| pkg.id == id)
+        .expect("Failed to find package");
+    if package.source.is_some() {
+        return Ok(());
+    }
+
+    let enabled_features = HashSet::<String>::from_iter(node.features.iter().cloned());
+
+    for target in &package.targets {
+        if !target
+            .kind
+            .iter()
+            .any(|k| *k == TargetKind::Bin || *k == TargetKind::Lib)
+        {
+            continue;
+        }
+
+        let src_path = root.join(&target.src_path);
+        unfeature_module(
+            root,
+            &src_path,
+            destination,
+            match_features,
+            &enabled_features,
+        )?;
+    }
+
+    for dep in &node.deps {
+        unfeature_crate(
+            root,
+            destination,
+            dep.pkg.clone(),
+            resolve,
+            packages,
+            match_features,
+        )?;
+    }
+
+    // Copy and handle manifest
+    unfeature_manifest(
+        root,
+        package.manifest_path.as_std_path(),
+        destination,
+        match_features,
+        &enabled_features,
+    )?;
+
+    let manifest_dir = package.manifest_path.parent().unwrap();
+    let additional_files = [
+        "README.md",
+        "LICENSE",
+        "build.rs",
+        "rust-toolchain",
+        "rustfmt.toml",
+        ".gitignore",
+        ".cargo/config.toml",
+        ".cargo/config",
+    ];
+    for file in additional_files.iter() {
+        let file_path = manifest_dir.join(file);
+        if file_path.exists() {
+            if file_path.extension() == Some("rs") {
+                unfeature_module(
+                    root,
+                    file_path.as_std_path(),
+                    destination,
+                    match_features,
+                    &enabled_features,
+                )?;
+            } else {
+                let dest_path = destination.join(&file_path.strip_prefix(root).unwrap());
+                info!(
+                    "Copy: {:?} -> {dest_path:?}",
+                    file_path.strip_prefix(root).unwrap()
+                );
+                std::fs::create_dir_all(dest_path.parent().unwrap())?;
+                std::fs::copy(&file_path, dest_path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn unfeature_module(
+    root: &Path,
+    src_path: &Path,
+    dest_dir: &Path,
+    match_features: &Regex,
+    enabled_features: &HashSet<String>,
+) -> Result<(), Error> {
+    let destination = dest_dir.join(&src_path.strip_prefix(root).unwrap());
+
+    info!(
+        "Unfeature: {:?} -> {destination:?}",
+        src_path.strip_prefix(root).unwrap()
+    );
+    let code = std::fs::read_to_string(&src_path)?;
+    let (code, submodules) = unfeature::unfeature(&code, match_features, &enabled_features)?;
+    std::fs::create_dir_all(destination.parent().unwrap())?;
+    std::fs::write(&destination, code)?;
+    debug!("Submodules: {submodules:?}");
+
+    for submodule in submodules {
+        if submodule.contains('.') {
+            debug!("Included file: {submodule:?}");
+            let file_path = src_path.parent().unwrap().join(submodule).canonicalize()?;
+            let dest_path = dest_dir.join(&file_path.strip_prefix(root).unwrap());
+            info!(
+                "Copy: {:?} -> {dest_path:?}",
+                file_path.strip_prefix(root).unwrap()
+            );
+            std::fs::create_dir_all(dest_path.parent().unwrap())?;
+            std::fs::copy(&file_path, dest_path)?;
+            continue;
+        }
+
+        let mut file_path = src_path
+            .with_file_name(submodule.clone())
+            .with_extension("rs");
+        if !file_path.exists() {
+            file_path = src_path.with_file_name(submodule.clone()).join("mod.rs");
+        }
+        unfeature_module(root, &file_path, dest_dir, match_features, enabled_features)?;
+    }
+
+    Ok(())
+}
+
+fn unfeature_manifest(
+    root: &Path,
+    src_path: &Path,
+    dest_dir: &Path,
+    match_features: &Regex,
+    enabled_features: &HashSet<String>,
+) -> Result<(), Error> {
+    let destination = dest_dir.join(&src_path.strip_prefix(root).unwrap());
+
+    info!(
+        "Unfeature: {:?} -> {destination:?}",
+        src_path.strip_prefix(root).unwrap()
+    );
+
+    let mut manifest = Manifest::from_path(&src_path).unwrap();
+
+    let mut enabled_deps = HashMap::new();
+
+    if let Some(features) = &mut manifest.features {
+        features.retain(|feature, deps| {
+            if feature == "default" {
+                deps.retain(|dep| !match_features.is_match(dep) || enabled_features.contains(dep));
+                return true;
+            }
+
+            let matched = match_features.is_match(feature);
+            // Enable dependencies for unmatched or enabled features
+            if !matched || enabled_features.contains(feature) {
+                for dep in deps {
+                    if dep.starts_with("dep:") {
+                        // Enabled features are not optional anymore
+                        enabled_deps.insert(dep[4..].to_string(), !matched);
+                    }
+                }
+            }
+            !match_features.is_match(feature)
+        });
+    }
+
+    if let Some(workspace) = &mut manifest.workspace {
+        workspace
+            .members
+            .retain(|member| dest_dir.join(member).exists());
+    }
+
+    fn retain_dep(
+        name: &str,
+        dep: &mut cargo_manifest::Dependency,
+        enabled_deps: &HashMap<String, bool>,
+    ) -> bool {
+        if let cargo_manifest::Dependency::Detailed(dep) = dep {
+            if let Some(optional) = &mut dep.optional {
+                if !*optional {
+                    return true;
+                }
+                // Check if feature set enables this dependency
+                if let Some(opt) = enabled_deps.get(name) {
+                    *optional = *opt;
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    // Remove disabled optional dependencies
+    if let Some(dependencies) = &mut manifest.dependencies {
+        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+    }
+    if let Some(dependencies) = &mut manifest.build_dependencies {
+        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+    }
+    if let Some(dependencies) = &mut manifest.dev_dependencies {
+        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+    }
+
+    std::fs::create_dir_all(destination.parent().unwrap())?;
+    let out = toml::to_string_pretty(&manifest).unwrap();
+    std::fs::write(&destination, out)?;
+
+    Ok(())
 }
