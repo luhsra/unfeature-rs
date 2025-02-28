@@ -16,6 +16,10 @@ use syn::{token, Macro};
 
 use crate::error::Error;
 
+/// Remove features from the input source code and also return included files
+///
+/// Included rust files (e.g., submodules) do not have the '*.rs' extension
+/// and they can also correspond to '<name>/mod.rs' files.
 pub fn unfeature(
     input: &str,
     known_features: &Regex,
@@ -26,11 +30,13 @@ pub fn unfeature(
     let mut remover = FeatureRemover::new(&known_features, &enabled_features);
     remover.visit_file(&mut parsed);
 
+    // Here we want to remove the spans from the input code
+    // This way we do not lose comments and formatting
     let mut output = input.to_string();
 
     let mut offset = 0;
     let mut last_end = 0;
-    for (span, replacement) in remover.removed {
+    for (span, replacement) in remover.replacements {
         debug!("removing: {}:{}", span.start().line, span.start().column);
         let range = span.byte_range();
 
@@ -87,16 +93,23 @@ pub fn unfeature(
 
     output = format!("{}\n", output.trim());
 
-    Ok((output, remover.submodules))
+    Ok((output, remover.includes))
 }
 
+/// Collects and evaluates features and included files
 struct FeatureRemover<'a> {
+    /// Known features, every not enabled feature, matching this, is removed
     known_features: &'a Regex,
+    /// Enabled features
     enabled_features: &'a HashSet<String>,
-    removed: Vec<(Span, String)>,
+    /// Parent scopes, used to find code blocks that correspond to attributes
     parents: Vec<Span>,
-    submodules: Vec<String>,
+    /// Flag preventing opening parent scopes inside attributes
     inside_attr: bool,
+    /// Included files
+    includes: Vec<String>,
+    /// Replacements to be made
+    replacements: Vec<(Span, String)>,
 }
 
 impl<'a, 'ast> FeatureRemover<'a> {
@@ -104,13 +117,14 @@ impl<'a, 'ast> FeatureRemover<'a> {
         Self {
             known_features,
             enabled_features,
-            removed: Vec::new(),
+            replacements: Vec::new(),
             parents: Vec::new(),
-            submodules: Vec::new(),
+            includes: Vec::new(),
             inside_attr: false,
         }
     }
 
+    /// Visit an item which can have attributes
     #[track_caller]
     fn visit_attributed<T: Spanned + Debug>(
         &mut self,
@@ -127,7 +141,6 @@ impl<'a, 'ast> FeatureRemover<'a> {
                 Location::caller()
             );
             self.parents.push(spanned.span());
-            // TODO: Visit only if span is not removed
             visit_inner(self, spanned);
             self.parents.push(spanned.span());
         }
@@ -146,6 +159,9 @@ impl<'a, 'ast> FeatureRemover<'a> {
         }
         config
     }
+    /// Parse `cfg_attr` attribute
+    ///
+    /// Note: this cannot handle recursion!
     fn parse_cfg_attr(attr: &Attribute) -> Option<(Config, Vec<String>)> {
         if attr.path().is_ident("cfg_attr") {
             let mut config = None;
@@ -180,7 +196,7 @@ impl<'a, 'ast> FeatureRemover<'a> {
                 Ok(())
             });
             if let Err(e) = e {
-                debug!("skip: {:?} {}", attr.to_token_stream().to_string(), e);
+                debug!("skip: {:?} {e}", attr.to_token_stream().to_string());
             } else {
                 return config.map(|c| (c, replacements));
             }
@@ -199,7 +215,8 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
         syn::visit::visit_attribute(self, attr);
         self.inside_attr = false;
 
-        if let Some((removed, _)) = self.removed.last() {
+        // Skip if the attribute is inside a removed block
+        if let Some((removed, _)) = self.replacements.last() {
             if removed
                 .byte_range()
                 .contains(&attr.span().byte_range().start)
@@ -214,25 +231,25 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
                 debug!("enabled: {} {enabled}", attr.to_token_stream().to_string());
 
                 if enabled {
-                    self.removed.push((attr.span(), String::new()));
+                    self.replacements.push((attr.span(), String::new()));
                 } else {
+                    let parent = self.parents.last().unwrap();
                     trace!(
-                        "remove: {}: {:?} -- {:?}",
+                        "remove: {}:{} {}",
+                        parent.start().line,
+                        parent.start().column,
                         attr.to_token_stream().to_string(),
-                        self.parents.last().unwrap().start(),
-                        self.parents.last().unwrap().end()
                     );
-                    self.removed
-                        .push((self.parents.last().unwrap().clone(), String::new()));
+                    self.replacements.push((parent.clone(), String::new()));
                 }
             }
         } else if let Some((config, replacements)) = Self::parse_cfg_attr(attr) {
             if let Some(enabled) = config.enabled(&self.known_features, &self.enabled_features) {
                 debug!("enabled: {} {enabled}", attr.to_token_stream().to_string());
                 if enabled {
-                    self.removed.push((attr.span(), replacements.join("")));
+                    self.replacements.push((attr.span(), replacements.join("")));
                 } else {
-                    self.removed.push((attr.span(), String::new()));
+                    self.replacements.push((attr.span(), String::new()));
                 }
             }
         }
@@ -275,24 +292,30 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
         if !module.content.is_none() {
             return;
         }
+        // Collect included modules
         if module.attrs.iter().all(|attr| {
             Self::parse_cfg(attr).map_or(true, |c| {
                 c.enabled(&self.known_features, &self.enabled_features)
                     .unwrap_or(true)
             })
         }) {
-            self.submodules.push(module.ident.to_string());
+            self.includes.push(module.ident.to_string());
         }
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.visit_attributed(mac, syn::visit::visit_macro);
 
-        if mac.path.is_ident("include_str") {
+        // Collect included files
+        if mac.path.is_ident("include")
+            || mac.path.is_ident("include_str")
+            || mac.path.is_ident("include_bytes")
+        {
             if let Some(lit) = mac.tokens.clone().into_iter().next() {
                 if let TokenTree::Literal(lit) = lit {
                     let path = lit.to_string();
                     let path = &path[1..path.len() - 1];
-                    self.submodules.push(path.to_string());
+                    let path = path.strip_suffix(".rs").unwrap_or(path);
+                    self.includes.push(path.to_string());
                 }
             }
         } else if mac.path.is_ident("global_asm")
