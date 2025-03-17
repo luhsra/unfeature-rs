@@ -37,7 +37,13 @@ pub fn unfeature(
     let mut offset = 0;
     let mut last_end = 0;
     for (span, replacement) in remover.replacements {
-        debug!("removing: {}:{}", span.start().line, span.start().column);
+        debug!(
+            "removing: {}:{} -- {}:{}",
+            span.start().line,
+            span.start().column,
+            span.end().line,
+            span.end().column
+        );
         let range = span.byte_range();
 
         if range.start < last_end {
@@ -50,14 +56,26 @@ pub fn unfeature(
             fn no_space(c: char) -> bool {
                 c != ' ' && c != '\t'
             }
-            let line_start = input[..range.start]
-                .rfind(no_space)
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let line_end = input[range.end..]
+            let mut line_start = range.start;
+
+            let mut line_end = input[range.end..]
                 .find(no_space)
-                .map(|i| range.end + i + 1)
+                .map(|i| range.end + i)
                 .unwrap_or(input.len());
+            // Include trailing comma/semicolon
+            if input[line_end..].starts_with(',') || input[line_end..].starts_with(';') {
+                line_end += 1;
+            }
+            // Include trailing newline
+            if input[line_end..].starts_with('\n') {
+                line_end += 1;
+                // Also remove leading indentation
+                let first_non_space = input[..range.start].rfind(no_space).unwrap_or(0);
+                if input[first_non_space..].starts_with('\n') {
+                    line_start = first_non_space + 1;
+                }
+            }
+
             line_start..line_end
         } else {
             range
@@ -135,9 +153,11 @@ impl<'a, 'ast> FeatureRemover<'a> {
             visit_inner(self, spanned);
         } else {
             trace!(
-                "visit: {}:{} {} {spanned:?}",
+                "visit: {}:{} - {}:{} {} {spanned:?}",
                 spanned.span().start().line,
                 spanned.span().start().column,
+                spanned.span().end().line,
+                spanned.span().end().column,
                 Location::caller()
             );
             self.parents.push(spanned.span());
@@ -281,6 +301,9 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
     }
     fn visit_variant(&mut self, arm: &'ast syn::Variant) {
         self.visit_attributed(arm, syn::visit::visit_variant);
+    }
+    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
+        self.visit_attributed(i, syn::visit::visit_impl_item);
     }
     fn visit_fn_arg(&mut self, i: &'ast syn::FnArg) {
         self.visit_attributed(i, syn::visit::visit_fn_arg);
@@ -430,8 +453,18 @@ mod test {
 
     use super::{unfeature, Config};
 
+    fn logger() {
+        let _ = env_logger::builder()
+            .is_test(true)
+            .filter_level(log::LevelFilter::Debug)
+            .format_timestamp(None)
+            .try_init();
+    }
+
     #[test]
     fn parse_cfg() {
+        logger();
+
         fn p_cfg(attr: &Attribute) -> Result<Config, syn::Error> {
             let mut config = None;
             if attr.path().is_ident("cfg") {
@@ -486,6 +519,8 @@ mod test {
 
     #[test]
     fn basic() {
+        logger();
+
         let input = r#"
         // Comment
         #[cfg(feature = "foo")]
@@ -524,6 +559,8 @@ mod test {
 
     #[test]
     fn remove_whole_file() {
+        logger();
+
         let input = r#"
         #![cfg(not(feature = "foo"))]
 
@@ -546,6 +583,8 @@ mod test {
 
     #[test]
     fn comments() {
+        logger();
+
         let input = r#"
         #[cfg(feature = "foo")]
         fn foo() {}
@@ -579,6 +618,8 @@ mod test {
 
     #[test]
     fn cfg_attr() {
+        logger();
+
         let input = r#"
         #![cfg_attr(feature = "foo", allow(dead_code))]
         #![cfg_attr(feature = "bar", no_std)]
@@ -624,6 +665,101 @@ mod test {
 
         #[allow(dead_code)]
         fn all_foo_any_bar_baz() {}
+"#;
+        assert_eq!(output, expected);
+    }
+    #[test]
+    fn fn_arg() {
+        logger();
+
+        let input = r#"#[cfg(feature = "task_22")]
+        use alloc::vec::Vec;
+
+        /// The [`Thread`] is an object used by the [`Scheduler`][super::scheduler::Scheduler].
+        pub struct Thread {
+            /// Thread id, each thread should have a different one
+            pub id: usize,
+            /// Entry point of the thread
+            pub action: extern "C" fn() -> !,
+            /// Register context of the thread
+            pub context: Context,
+            /// Kernel stack
+            #[cfg(not(feature = "task_23"))]
+            kernel_stack: &'static mut [usize],
+            #[cfg(feature = "task_23")]
+            kernel_stack: Vec<usize>,
+            #[cfg(feature = "task_13")]
+            /// If this thread has been exited
+            pub exited: bool,
+        }
+        impl Thread {
+            pub fn new(
+                id: usize,
+                action: extern "C" fn() -> !,
+                #[cfg(not(feature = "task_22"))] kernel_stack: &'static mut [usize],
+                #[cfg(feature = "task_22")] mut kernel_stack: Vec<usize>,
+            ) -> Self {
+                #[cfg(not(feature = "task_23"))]
+                let syscall_ret = 0;
+
+                // Setup contet and stack
+                let context = Context::prepare(
+                    &mut *kernel_stack,
+                    Self::kernel_kickoff,
+                    [action as usize, 0, 0],
+                );
+
+                Self {
+                    id,
+                    action,
+                    context,
+                    kernel_stack,
+                    #[cfg(feature = "task_13")]
+                    exited: false,
+                }
+            }
+        }
+"#;
+
+        let known_features = Regex::new("task_").unwrap();
+        let enabled_features = HashSet::from_iter([]);
+
+        let (output, _) = unfeature(&input, &known_features, &enabled_features).unwrap();
+        println!("Output: {}", output);
+        let expected = r#"/// The [`Thread`] is an object used by the [`Scheduler`][super::scheduler::Scheduler].
+        pub struct Thread {
+            /// Thread id, each thread should have a different one
+            pub id: usize,
+            /// Entry point of the thread
+            pub action: extern "C" fn() -> !,
+            /// Register context of the thread
+            pub context: Context,
+            /// Kernel stack
+            kernel_stack: &'static mut [usize],
+        }
+        impl Thread {
+            pub fn new(
+                id: usize,
+                action: extern "C" fn() -> !,
+                kernel_stack: &'static mut [usize],
+            ) -> Self {
+                let syscall_ret = 0;
+
+                // Setup contet and stack
+                let context = Context::prepare(
+                    &mut *kernel_stack,
+                    Self::kernel_kickoff,
+                    [action as usize, 0, 0],
+                );
+
+                Self {
+                    id,
+                    action,
+                    context,
+                    kernel_stack,
+                }
+            }
+        }
 "#;
         assert_eq!(output, expected);
     }

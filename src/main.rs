@@ -97,7 +97,10 @@ fn main() -> ExitCode {
     for file in additional_files {
         let file = file.canonicalize().unwrap();
         let dest_path = output.join(&file.strip_prefix(root).unwrap());
-        info!("Copy: {:?} -> {dest_path:?}", file.strip_prefix(root).unwrap());
+        info!(
+            "Copy: {:?} -> {dest_path:?}",
+            file.strip_prefix(root).unwrap()
+        );
         std::fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
         std::fs::copy(&file, dest_path).unwrap();
     }
