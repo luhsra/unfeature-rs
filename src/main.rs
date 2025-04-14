@@ -1,10 +1,8 @@
-use std::collections::HashMap;
 use std::iter::FromIterator;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::{collections::HashSet, path::Path};
 
-use cargo_manifest::Manifest;
 use cargo_metadata::{CargoOpt, MetadataCommand, Package, PackageId, Resolve, TargetKind};
 
 use clap::Parser;
@@ -12,6 +10,7 @@ use error::Error;
 use log::{debug, error, info};
 use regex::Regex;
 mod error;
+mod manifest;
 mod unfeature;
 
 /// Generate new crate with inlined enabled/disabled features
@@ -162,7 +161,7 @@ fn unfeature_crate(
     }
 
     // Copy and handle manifest
-    unfeature_manifest(
+    manifest::unfeature(
         root,
         package.manifest_path.as_std_path(),
         destination,
@@ -248,90 +247,6 @@ fn unfeature_module(
         }
         unfeature_module(root, &file_path, dest_dir, match_features, enabled_features)?;
     }
-
-    Ok(())
-}
-
-fn unfeature_manifest(
-    root: &Path,
-    src_path: &Path,
-    dest_dir: &Path,
-    match_features: &Regex,
-    enabled_features: &HashSet<String>,
-) -> Result<(), Error> {
-    let destination = dest_dir.join(&src_path.strip_prefix(root).unwrap());
-
-    info!(
-        "Unfeature: {:?} -> {destination:?}",
-        src_path.strip_prefix(root).unwrap()
-    );
-
-    let mut manifest = Manifest::from_path(&src_path).unwrap();
-
-    let mut enabled_deps = HashMap::new();
-
-    if let Some(features) = &mut manifest.features {
-        features.retain(|feature, deps| {
-            if feature == "default" {
-                deps.retain(|dep| !match_features.is_match(dep) || enabled_features.contains(dep));
-                return true;
-            }
-
-            let matched = match_features.is_match(feature);
-            // Enable dependencies for unmatched or enabled features
-            if !matched || enabled_features.contains(feature) {
-                for dep in deps {
-                    if dep.starts_with("dep:") {
-                        // Enabled features are not optional anymore
-                        enabled_deps.insert(dep[4..].to_string(), !matched);
-                    }
-                }
-            }
-            !match_features.is_match(feature)
-        });
-    }
-
-    if let Some(workspace) = &mut manifest.workspace {
-        workspace
-            .members
-            .retain(|member| dest_dir.join(member).exists());
-    }
-
-    fn retain_dep(
-        name: &str,
-        dep: &mut cargo_manifest::Dependency,
-        enabled_deps: &HashMap<String, bool>,
-    ) -> bool {
-        if let cargo_manifest::Dependency::Detailed(dep) = dep {
-            if let Some(optional) = &mut dep.optional {
-                if !*optional {
-                    return true;
-                }
-                // Check if feature set enables this dependency
-                if let Some(opt) = enabled_deps.get(name) {
-                    *optional = *opt;
-                } else {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    // Remove disabled optional dependencies
-    if let Some(dependencies) = &mut manifest.dependencies {
-        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
-    }
-    if let Some(dependencies) = &mut manifest.build_dependencies {
-        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
-    }
-    if let Some(dependencies) = &mut manifest.dev_dependencies {
-        dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
-    }
-
-    std::fs::create_dir_all(destination.parent().unwrap())?;
-    let out = toml::to_string_pretty(&manifest).unwrap();
-    std::fs::write(&destination, out)?;
 
     Ok(())
 }
