@@ -11,8 +11,8 @@ use syn::meta::ParseNestedMeta;
 use syn::parse::StepCursor;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-use syn::{parenthesized, AttrStyle, Attribute, LitStr};
-use syn::{token, Macro};
+use syn::{AttrStyle, Attribute, LitStr, parenthesized};
+use syn::{Macro, token};
 
 use crate::error::Error;
 
@@ -25,10 +25,10 @@ pub fn unfeature(
     known_features: &Regex,
     enabled_features: &HashSet<String>,
 ) -> Result<(String, Vec<String>), Error> {
-    let mut parsed = syn::parse_file(&input)?;
+    let parsed = syn::parse_file(input)?;
 
-    let mut remover = FeatureRemover::new(&known_features, &enabled_features);
-    remover.visit_file(&mut parsed);
+    let mut remover = FeatureRemover::new(known_features, enabled_features);
+    remover.visit_file(&parsed);
 
     // Here we want to remove the spans from the input code
     // This way we do not lose comments and formatting
@@ -205,7 +205,7 @@ impl<'a, 'ast> FeatureRemover<'a> {
                         content.step(read_to_end).unwrap();
                         format!("{name}({inner})")
                     } else {
-                        format!("{name}")
+                        name
                     };
                     let replacement = match attr.style {
                         AttrStyle::Outer => format!("#[{replacement}]"),
@@ -225,7 +225,7 @@ impl<'a, 'ast> FeatureRemover<'a> {
     }
 }
 
-impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
+impl<'ast> Visit<'ast> for FeatureRemover<'_> {
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         if self.inside_attr {
             return;
@@ -241,14 +241,14 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
                 .byte_range()
                 .contains(&attr.span().byte_range().start)
             {
-                debug!("skip: {}", attr.to_token_stream().to_string());
+                debug!("skip: {}", attr.to_token_stream());
                 return;
             }
         }
 
         if let Some(config) = Self::parse_cfg(attr) {
-            if let Some(enabled) = config.enabled(&self.known_features, &self.enabled_features) {
-                debug!("enabled: {} {enabled}", attr.to_token_stream().to_string());
+            if let Some(enabled) = config.enabled(self.known_features, self.enabled_features) {
+                debug!("enabled: {} {enabled}", attr.to_token_stream());
 
                 if enabled {
                     self.replacements.push((attr.span(), String::new()));
@@ -258,14 +258,14 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
                         "remove: {}:{} {}",
                         parent.start().line,
                         parent.start().column,
-                        attr.to_token_stream().to_string(),
+                        attr.to_token_stream(),
                     );
-                    self.replacements.push((parent.clone(), String::new()));
+                    self.replacements.push((*parent, String::new()));
                 }
             }
         } else if let Some((config, replacements)) = Self::parse_cfg_attr(attr) {
-            if let Some(enabled) = config.enabled(&self.known_features, &self.enabled_features) {
-                debug!("enabled: {} {enabled}", attr.to_token_stream().to_string());
+            if let Some(enabled) = config.enabled(self.known_features, self.enabled_features) {
+                debug!("enabled: {} {enabled}", attr.to_token_stream());
                 if enabled {
                     self.replacements.push((attr.span(), replacements.join("")));
                 } else {
@@ -312,13 +312,13 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
         self.visit_attributed(module, syn::visit::visit_item_mod);
 
         // We are only looking for external submodules
-        if !module.content.is_none() {
+        if module.content.is_some() {
             return;
         }
         // Collect included modules
         if module.attrs.iter().all(|attr| {
-            Self::parse_cfg(attr).map_or(true, |c| {
-                c.enabled(&self.known_features, &self.enabled_features)
+            Self::parse_cfg(attr).is_none_or(|c| {
+                c.enabled(self.known_features, self.enabled_features)
                     .unwrap_or(true)
             })
         }) {
@@ -333,13 +333,11 @@ impl<'a, 'ast> Visit<'ast> for FeatureRemover<'a> {
             || mac.path.is_ident("include_str")
             || mac.path.is_ident("include_bytes")
         {
-            if let Some(lit) = mac.tokens.clone().into_iter().next() {
-                if let TokenTree::Literal(lit) = lit {
-                    let path = lit.to_string();
-                    let path = &path[1..path.len() - 1];
-                    let path = path.strip_suffix(".rs").unwrap_or(path);
-                    self.includes.push(path.to_string());
-                }
+            if let Some(TokenTree::Literal(lit)) = mac.tokens.clone().into_iter().next() {
+                let path = lit.to_string();
+                let path = &path[1..path.len() - 1];
+                let path = path.strip_suffix(".rs").unwrap_or(path);
+                self.includes.push(path.to_string());
             }
         } else if mac.path.is_ident("global_asm")
             || mac.path.is_ident("asm")
@@ -449,9 +447,9 @@ mod test {
     use std::iter::FromIterator;
 
     use regex::Regex;
-    use syn::{parse_quote, spanned::Spanned, Attribute};
+    use syn::{Attribute, parse_quote, spanned::Spanned};
 
-    use super::{unfeature, Config};
+    use super::{Config, unfeature};
 
     fn logger() {
         let _ = env_logger::builder()

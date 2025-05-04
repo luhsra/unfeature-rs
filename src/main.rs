@@ -70,7 +70,7 @@ fn main() -> ExitCode {
     if no_default_features {
         meta_cmd.features(CargoOpt::NoDefaultFeatures);
     }
-    if features.len() > 0 {
+    if !features.is_empty() {
         meta_cmd.features(CargoOpt::SomeFeatures(features));
     }
     let meta = meta_cmd.exec().expect("Failed to get metadata");
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
 
     for file in additional_files {
         let file = file.canonicalize().unwrap();
-        let dest_path = output.join(&file.strip_prefix(root).unwrap());
+        let dest_path = output.join(file.strip_prefix(root).unwrap());
         info!(
             "Copy: {:?} -> {dest_path:?}",
             file.strip_prefix(root).unwrap()
@@ -192,7 +192,7 @@ fn unfeature_crate(
                     &enabled_features,
                 )?;
             } else {
-                let dest_path = destination.join(&file_path.strip_prefix(root).unwrap());
+                let dest_path = destination.join(file_path.strip_prefix(root).unwrap());
                 info!(
                     "Copy: {:?} -> {dest_path:?}",
                     file_path.strip_prefix(root).unwrap()
@@ -213,14 +213,14 @@ fn unfeature_module(
     match_features: &Regex,
     enabled_features: &HashSet<String>,
 ) -> Result<(), Error> {
-    let destination = dest_dir.join(&src_path.strip_prefix(root).unwrap());
+    let destination = dest_dir.join(src_path.strip_prefix(root).unwrap());
 
     info!(
         "Unfeature: {:?} -> {destination:?}",
         src_path.strip_prefix(root).unwrap()
     );
-    let code = std::fs::read_to_string(&src_path)?;
-    let (code, submodules) = unfeature::unfeature(&code, match_features, &enabled_features)?;
+    let code = std::fs::read_to_string(src_path)?;
+    let (code, submodules) = unfeature::unfeature(&code, match_features, enabled_features)?;
     std::fs::create_dir_all(destination.parent().unwrap())?;
     std::fs::write(&destination, code)?;
     debug!("Submodules: {submodules:?}");
@@ -229,7 +229,7 @@ fn unfeature_module(
         if submodule.contains('.') {
             debug!("Included file: {submodule:?}");
             let file_path = src_path.parent().unwrap().join(submodule).canonicalize()?;
-            let dest_path = dest_dir.join(&file_path.strip_prefix(root).unwrap());
+            let dest_path = dest_dir.join(file_path.strip_prefix(root).unwrap());
             info!(
                 "Copy: {:?} -> {dest_path:?}",
                 file_path.strip_prefix(root).unwrap()

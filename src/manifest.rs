@@ -14,14 +14,14 @@ pub fn unfeature(
     match_features: &Regex,
     enabled_features: &HashSet<String>,
 ) -> Result<(), Error> {
-    let destination = dest_dir.join(&src_path.strip_prefix(root).unwrap());
+    let destination = dest_dir.join(src_path.strip_prefix(root).unwrap());
 
     info!(
         "Unfeature: {:?} -> {destination:?}",
         src_path.strip_prefix(root).unwrap()
     );
 
-    let mut manifest = Manifest::from_path(&src_path).unwrap();
+    let mut manifest = Manifest::from_path(src_path).unwrap();
 
     let mut enabled_deps = HashMap::new();
 
@@ -36,9 +36,9 @@ pub fn unfeature(
             // Enable dependencies for unmatched or enabled features
             if !matched || enabled_features.contains(feature) {
                 for dep in deps {
-                    if dep.starts_with("dep:") {
+                    if let Some(suffix) = dep.strip_prefix("dep:") {
                         // Enabled features are not optional anymore
-                        enabled_deps.insert(dep[4..].to_string(), !matched);
+                        enabled_deps.insert(suffix.to_string(), !matched);
                     }
                 }
             }
