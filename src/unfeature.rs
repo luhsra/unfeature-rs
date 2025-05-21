@@ -195,14 +195,14 @@ impl<'a, 'ast> FeatureRemover<'a> {
                 } else {
                     // Following attributes
                     let replacement = if let Ok(value) = meta.value() {
-                        let inner = value.span().source_text().unwrap();
-                        value.step(read_to_end).unwrap();
+                        let span = value.step(read_to_end).unwrap();
+                        let inner = span.source_text().unwrap();
                         format!("{name} = {inner}")
                     } else if meta.input.peek(token::Paren) {
                         let content;
                         parenthesized!(content in meta.input);
-                        let inner = content.span().source_text().unwrap();
-                        content.step(read_to_end).unwrap();
+                        let span = content.step(read_to_end).unwrap();
+                        let inner = span.source_text().unwrap();
                         format!("{name}({inner})")
                     } else {
                         name
@@ -433,12 +433,14 @@ impl Config {
     }
 }
 
-fn read_to_end<'c>(cursor: StepCursor<'c, '_>) -> Result<((), Cursor<'c>), syn::Error> {
+fn read_to_end<'c>(cursor: StepCursor<'c, '_>) -> Result<(Span, Cursor<'c>), syn::Error> {
+    let mut span = cursor.span();
     let mut cursor = *cursor;
-    while let Some((_, next)) = cursor.token_tree() {
+    while let Some((tt, next)) = cursor.token_tree() {
+        span = span.join(tt.span()).unwrap();
         cursor = next;
     }
-    Ok(((), cursor))
+    Ok((span, cursor))
 }
 
 #[cfg(test)]
