@@ -128,7 +128,7 @@ fn unfeature_crate(
         return Ok(());
     }
 
-    let enabled_features = HashSet::<String>::from_iter(node.features.iter().cloned());
+    let enabled_features = HashSet::<String>::from_iter(node.features.iter().map(|f| f.to_string()));
 
     for target in &package.targets {
         if !target
