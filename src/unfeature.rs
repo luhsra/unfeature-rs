@@ -351,6 +351,17 @@ impl<'ast> Visit<'ast> for FeatureRemover<'_> {
             }) {
                 self.visit_macro(&body);
             }
+        } else if mac.path.is_ident("println") {
+            // find cargo:rerun-if-changed -> these files are also needed for the build
+            if let Some(TokenTree::Literal(lit)) = mac.tokens.clone().into_iter().next() {
+                let path = lit.to_string();
+                debug!("{path:?}");
+                if let Some(path) = path.strip_prefix("\"cargo:rerun-if-changed=")
+                    && let Some(path) = path.strip_suffix("\"")
+                {
+                    self.includes.push(path.to_string());
+                }
+            }
         }
     }
 }
@@ -762,5 +773,29 @@ mod test {
         }
 "#;
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn build_if_canged() {
+        logger();
+
+        let input = r#"fn main() {
+            println!("Hello, world!");
+            println!("cargo:rerun-if-changed=build/link.ld");
+            println!("cargo:rerun-if-changed=src/something.c");
+        }
+"#;
+
+        let known_features = Regex::new("task_").unwrap();
+        let enabled_features = HashSet::from_iter([]);
+
+        let (output, includes) = unfeature(&input, &known_features, &enabled_features).unwrap();
+        println!("Output: {}", output);
+        assert_eq!(output, input);
+        println!("Includes: {:?}", includes);
+        assert_eq!(
+            includes,
+            vec!["build/link.ld".to_string(), "src/something.c".to_string()]
+        );
     }
 }

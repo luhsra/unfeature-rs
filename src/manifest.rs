@@ -76,12 +76,21 @@ pub fn unfeature(
     // Remove disabled optional dependencies
     if let Some(dependencies) = &mut manifest.dependencies {
         dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+        if dependencies.is_empty() {
+            manifest.dependencies = None;
+        }
     }
     if let Some(dependencies) = &mut manifest.build_dependencies {
         dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+        if dependencies.is_empty() {
+            manifest.build_dependencies = None;
+        }
     }
     if let Some(dependencies) = &mut manifest.dev_dependencies {
         dependencies.retain(|name, dep| retain_dep(name, dep, &enabled_deps));
+        if dependencies.is_empty() {
+            manifest.dev_dependencies = None;
+        }
     }
 
     std::fs::create_dir_all(destination.parent().unwrap())?;
