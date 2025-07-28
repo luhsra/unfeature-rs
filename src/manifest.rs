@@ -93,6 +93,14 @@ pub fn unfeature(
         }
     }
 
+    // Deprecation
+    for bin in manifest.bin.iter_mut() {
+        bin.edition = None;
+    }
+    if let Some(lib) = manifest.lib.as_mut() {
+        lib.edition = None;
+    }
+
     std::fs::create_dir_all(destination.parent().unwrap())?;
     let out = toml::to_string_pretty(&manifest).unwrap();
     std::fs::write(&destination, out)?;
