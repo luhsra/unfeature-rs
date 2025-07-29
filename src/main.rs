@@ -15,6 +15,7 @@ mod unfeature;
 
 /// Generate new crate with inlined enabled/disabled features
 #[derive(Debug, Parser)]
+#[clap(version, about)]
 struct Args {
     /// Has to be "unfeature"
     command: String,
@@ -128,7 +129,8 @@ fn unfeature_crate(
         return Ok(());
     }
 
-    let enabled_features = HashSet::<String>::from_iter(node.features.iter().map(|f| f.to_string()));
+    let enabled_features =
+        HashSet::<String>::from_iter(node.features.iter().map(|f| f.to_string()));
 
     for target in &package.targets {
         if !target
@@ -238,12 +240,14 @@ fn unfeature_module(
             std::fs::copy(&file_path, dest_path)?;
             continue;
         }
+        if submodule.ends_with("/") {
+            debug!("Skipping directory: {submodule:?}");
+            continue; // Skip directories
+        }
 
-        let mut file_path = src_path
-            .with_file_name(submodule.clone())
-            .with_extension("rs");
+        let mut file_path = src_path.with_file_name(&submodule).with_extension("rs");
         if !file_path.exists() {
-            file_path = src_path.with_file_name(submodule.clone()).join("mod.rs");
+            file_path = src_path.with_file_name(&submodule).join("mod.rs");
         }
         unfeature_module(root, &file_path, dest_dir, match_features, enabled_features)?;
     }

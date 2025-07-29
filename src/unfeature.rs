@@ -44,11 +44,46 @@ pub fn unfeature(
             span.end().line,
             span.end().column
         );
-        let range = span.byte_range();
+        let mut range = span.byte_range();
 
         if range.start < last_end {
             debug!("overlapping: {}:{}", span.start().line, span.start().column);
-            continue;
+
+            if range.end <= last_end {
+                debug!("skipping: {}:{}", span.start().line, span.start().column);
+                continue; // Skip already removed spans
+            }
+
+            debug!(
+                "input={:?}",
+                &input[last_end..input.len().min(last_end + 40)]
+            );
+            range.start = last_end.max(offset);
+            // This might be due to a comment that should be shown but not the
+            // corresponding code block
+            // Find comment inside the range...
+            loop {
+                let comment_start = range.start
+                    + input[range.start..]
+                        .find(|c: char| !c.is_whitespace())
+                        .unwrap_or(input.len());
+                debug!(
+                    "comment start: {:?}",
+                    &input[comment_start..input.len().min(comment_start + 40)]
+                );
+                if input[comment_start..].starts_with("// ") {
+                    // ...and remove it
+                    let comment_end = input[comment_start..].find('\n').unwrap_or(input.len());
+                    debug!(
+                        "comment: {:?}",
+                        &input[comment_start..comment_start + comment_end]
+                    );
+                    range.start = comment_start + comment_end + 1;
+                } else {
+                    // No comment found, break
+                    break;
+                }
+            }
         }
 
         let range = if replacement.is_empty() {
@@ -82,6 +117,7 @@ pub fn unfeature(
         };
         let range = range.start - offset..range.end - offset;
 
+        trace!("replace {:?} -> {:?}", &output[range.clone()], replacement);
         output.replace_range(range.clone(), &replacement);
         offset += range.end - range.start;
         offset -= replacement.len();
@@ -236,32 +272,33 @@ impl<'ast> Visit<'ast> for FeatureRemover<'_> {
         self.inside_attr = false;
 
         // Skip if the attribute is inside a removed block
-        if let Some((removed, _)) = self.replacements.last() {
-            if removed
+        if let Some((removed, _)) = self.replacements.last()
+            && removed
                 .byte_range()
                 .contains(&attr.span().byte_range().start)
-            {
-                debug!("skip: {}", attr.to_token_stream());
-                return;
-            }
+        {
+            debug!("skip: {}", attr.to_token_stream());
+            return;
         }
 
         if let Some(config) = Self::parse_cfg(attr) {
-            if let Some(enabled) = config.enabled(self.known_features, self.enabled_features) {
-                debug!("enabled: {} {enabled}", attr.to_token_stream());
-
-                if enabled {
+            if let Some(replacement) = config.reduce(self.known_features, self.enabled_features) {
+                debug!("enabled: {} {replacement:?}", attr.to_token_stream());
+                if replacement.is_empty() {
                     self.replacements.push((attr.span(), String::new()));
                 } else {
-                    let parent = self.parents.last().unwrap();
-                    trace!(
-                        "remove: {}:{} {}",
-                        parent.start().line,
-                        parent.start().column,
-                        attr.to_token_stream(),
-                    );
-                    self.replacements.push((*parent, String::new()));
+                    self.replacements.push((attr.span(), format!("#[cfg({replacement})]")));
                 }
+            } else {
+                debug!("enabled: {} false", attr.to_token_stream());
+                let parent = self.parents.last().unwrap();
+                trace!(
+                    "remove: {}:{} {}",
+                    parent.start().line,
+                    parent.start().column,
+                    attr.to_token_stream(),
+                );
+                self.replacements.push((*parent, String::new()));
             }
         } else if let Some((config, replacements)) = Self::parse_cfg_attr(attr) {
             if let Some(enabled) = config.enabled(self.known_features, self.enabled_features) {
@@ -328,6 +365,14 @@ impl<'ast> Visit<'ast> for FeatureRemover<'_> {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         self.visit_attributed(mac, syn::visit::visit_macro);
 
+        // Skip if the macro is inside a removed block
+        if let Some((removed, _)) = self.replacements.last()
+            && removed.byte_range().contains(&mac.span().byte_range().end)
+        {
+            debug!("skip: {}", mac.to_token_stream());
+            return;
+        }
+
         // Collect included files
         if mac.path.is_ident("include")
             || mac.path.is_ident("include_str")
@@ -355,7 +400,6 @@ impl<'ast> Visit<'ast> for FeatureRemover<'_> {
             // find cargo:rerun-if-changed -> these files are also needed for the build
             if let Some(TokenTree::Literal(lit)) = mac.tokens.clone().into_iter().next() {
                 let path = lit.to_string();
-                debug!("{path:?}");
                 if let Some(path) = path.strip_prefix("\"cargo:rerun-if-changed=")
                     && let Some(path) = path.strip_suffix("\"")
                 {
@@ -442,6 +486,73 @@ impl Config {
             }
         }
     }
+
+    /// Returns None if the config is entirely disabled or a reduced version
+    fn reduce(&self, known: &Regex, enabled: &HashSet<String>) -> Option<String> {
+        match self {
+            Config::Feature(f) => {
+                if known.is_match(f) {
+                    if enabled.contains(f) {
+                        Some(String::new())
+                    } else {
+                        None
+                    }
+                } else {
+                    Some(format!("feature = \"{f}\""))
+                }
+            }
+            Config::Not(config) => {
+                if let Some(reduced) = config.reduce(known, enabled) {
+                    if reduced.is_empty() {
+                        None
+                    } else {
+                        Some(format!("not({reduced})"))
+                    }
+                } else {
+                    Some(String::new())
+                }
+            }
+            Config::Any(configs) => {
+                let mut reduced = Vec::new();
+                for config in configs {
+                    if let Some(r) = config.reduce(known, enabled) {
+                        if !r.is_empty() {
+                            reduced.push(r);
+                        } else {
+                            // If one of the configs is enabled, remove the whole `any`
+                            return Some(String::new());
+                        }
+                    }
+                }
+                if reduced.is_empty() {
+                    None
+                } else if reduced.len() == 1 {
+                    Some(reduced[0].clone())
+                } else {
+                    Some(format!("any({})", reduced.join(", ")))
+                }
+            }
+            Config::All(configs) => {
+                let mut reduced = Vec::new();
+                for config in configs {
+                    if let Some(r) = config.reduce(known, enabled) {
+                        if !r.is_empty() {
+                            reduced.push(r);
+                        }
+                    } else {
+                        return None; // If one of the configs is disabled, remove the whole `all`
+                    }
+                }
+                if reduced.is_empty() {
+                    Some(String::new())
+                } else if reduced.len() == 1 {
+                    Some(reduced[0].clone())
+                } else {
+                    Some(format!("all({})", reduced.join(", ")))
+                }
+            }
+        }
+    }
 }
 
 fn read_to_end<'c>(cursor: StepCursor<'c, '_>) -> Result<(Span, Cursor<'c>), syn::Error> {
@@ -459,6 +570,7 @@ mod test {
     use std::collections::HashSet;
     use std::iter::FromIterator;
 
+    use log::info;
     use regex::Regex;
     use syn::{Attribute, parse_quote, spanned::Spanned};
 
@@ -472,20 +584,20 @@ mod test {
             .try_init();
     }
 
+    fn p_cfg(attr: &Attribute) -> Result<Config, syn::Error> {
+        let mut config = None;
+        if attr.path().is_ident("cfg") {
+            let _ = attr.parse_nested_meta(|meta| {
+                config = Some(Config::parse_nested(meta)?);
+                Ok(())
+            });
+        }
+        config.ok_or_else(|| syn::Error::new(attr.span(), "expected `cfg`"))
+    }
+
     #[test]
     fn parse_cfg() {
         logger();
-
-        fn p_cfg(attr: &Attribute) -> Result<Config, syn::Error> {
-            let mut config = None;
-            if attr.path().is_ident("cfg") {
-                let _ = attr.parse_nested_meta(|meta| {
-                    config = Some(Config::parse_nested(meta)?);
-                    Ok(())
-                });
-            }
-            config.ok_or_else(|| syn::Error::new(attr.span(), "expected `cfg`"))
-        }
 
         let input: Attribute = parse_quote!(#[cfg(feature = "foo")]);
         assert_eq!(p_cfg(&input).unwrap(), Config::Feature("foo".to_string()));
@@ -525,6 +637,102 @@ mod test {
                     Config::Not(Box::new(Config::Feature("baz".to_string()))),
                 ])
             ])
+        );
+    }
+
+    #[test]
+    fn reduce_cfg() {
+        logger();
+
+        let known = Regex::new("(foo|bar)").unwrap();
+        let enabled = HashSet::from_iter(["foo".to_string()]);
+
+        let input = p_cfg(&parse_quote!(#[cfg(feature = "foo")])).unwrap();
+        assert_eq!(input.reduce(&known, &enabled), Some(String::new()));
+
+        let input = p_cfg(&parse_quote!(#[cfg(not(feature = "foo"))])).unwrap();
+        assert_eq!(input.reduce(&known, &enabled), None);
+
+        let input = p_cfg(&parse_quote!(#[cfg(any(feature = "foo", feature = "bar"))])).unwrap();
+        assert_eq!(input.reduce(&known, &enabled), Some(String::new()));
+
+        let input = p_cfg(&parse_quote!(#[cfg(any(
+            feature = "bar",
+            feature = "other"
+        ))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("feature = \"other\"".to_string())
+        );
+
+        let input = p_cfg(&parse_quote!(#[cfg(any(
+            feature = "foo",
+            feature = "other"
+        ))]))
+        .unwrap();
+        assert_eq!(input.reduce(&known, &enabled), Some(String::new()));
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(feature = "foo", feature = "bar"))])).unwrap();
+        assert_eq!(input.reduce(&known, &enabled), None);
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(
+            feature = "foo",
+            feature = "other"
+        ))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("feature = \"other\"".to_string())
+        );
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(
+            feature = "foo",
+            feature = "other",
+            feature = "xyz"
+        ))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("all(feature = \"other\", feature = \"xyz\")".to_string())
+        );
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(
+            feature = "foo", feature = "other", not(feature = "bar"),
+            any(feature = "xyz", not(feature = "foo"), feature = "bar")
+        ))]))
+        .unwrap();
+
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("all(feature = \"other\", feature = \"xyz\")".to_string())
+        );
+
+        let enabled = HashSet::from_iter(["foo".to_string(), "bar".to_string()]);
+
+        let input = p_cfg(&parse_quote!(#[cfg(any(feature = "bar", feature = "baz"))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("".to_string())
+        );
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(
+            feature = "foo", feature = "bar"
+        ))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("".to_string())
+        );
+
+        let input = p_cfg(&parse_quote!(#[cfg(all(
+            feature = "foo", any(feature = "bar", feature = "baz")
+        ))]))
+        .unwrap();
+        assert_eq!(
+            input.reduce(&known, &enabled),
+            Some("".to_string())
         );
     }
 
@@ -590,6 +798,54 @@ mod test {
         let (output, _) = unfeature(&input, &known_features, &enabled_features).unwrap();
         println!("Output: {:?}", output);
         assert_eq!(output.trim(), "");
+    }
+
+    #[test]
+    fn multiple_attr() {
+        logger();
+
+        let known_features = Regex::new("(foo|bar)").unwrap();
+        let enabled_features = HashSet::from_iter(["foo".to_string()]);
+
+        let input = r#"#[cfg(feature = "foo")]
+        #[cfg(feature = "bar")]
+        fn foo() {}
+        "#;
+
+        let (output, _) = unfeature(&input, &known_features, &enabled_features).unwrap();
+        info!("Output: {:?}", output);
+
+        let expected = "\n";
+        assert_eq!(output, expected);
+
+        let input = r#"#[cfg(feature = "foo")]
+        // ABC
+        // DEF
+        // GHI
+        #[cfg(feature = "bar")]
+        fn foo() {}
+        "#;
+
+        let (output, _) = unfeature(&input, &known_features, &enabled_features).unwrap();
+        info!("Output: {:?}", output);
+
+        let expected = r#"// ABC
+        // DEF
+        // GHI
+"#;
+        assert_eq!(output, expected);
+
+        let input = r#"#[cfg(feature = "foo")]
+        // Comment
+        #[cfg(feature = "bar")]
+        fn foo() {}
+        "#;
+
+        let (output, _) = unfeature(&input, &known_features, &enabled_features).unwrap();
+        info!("Output: {:?}", output);
+
+        let expected = "// Comment\n";
+        assert_eq!(output, expected);
     }
 
     #[test]
