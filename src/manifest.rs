@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use cargo_manifest::Manifest;
-use log::info;
 use regex::Regex;
+use tracing::info;
 
 use crate::error::Error;
 

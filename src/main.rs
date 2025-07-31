@@ -7,8 +7,8 @@ use cargo_metadata::{CargoOpt, MetadataCommand, Package, PackageId, Resolve, Tar
 
 use clap::Parser;
 use error::Error;
-use log::{debug, error, info};
 use regex::Regex;
+use tracing::{debug, error, info};
 mod error;
 mod manifest;
 mod unfeature;
@@ -51,10 +51,17 @@ fn main() -> ExitCode {
         manifest_path,
     } = Args::parse();
 
-    env_logger::builder().format_timestamp(None).init();
+    tracing_subscriber::fmt()
+        .compact()
+        .with_target(false)
+        .with_file(true)
+        .with_line_number(true)
+        .without_time()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
     if command != "unfeature" {
-        error!("Invalid command: {}", command);
+        error!("Invalid command: {command}");
         error!("This tool is expected to be executed by cargo: cargo unfeature");
         return ExitCode::FAILURE;
     }
