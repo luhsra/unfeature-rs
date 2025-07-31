@@ -24,7 +24,7 @@ struct Args {
     /// Regex to match features
     match_features: Regex,
     /// Additional files to copy
-    additional_files: Vec<PathBuf>,
+    additional_files: Vec<String>,
     /// Enabled features
     #[clap(short = 'F', long)]
     features: Vec<String>,
@@ -102,8 +102,14 @@ fn main() -> ExitCode {
     .unwrap();
 
     for file in additional_files {
-        let file = file.canonicalize().unwrap();
-        let dest_path = output.join(file.strip_prefix(root).unwrap());
+        let (src, dst) = if let Some(parts) = file.split_once('=') {
+            parts
+        } else {
+            (&*file, &*file)
+        };
+
+        let file = Path::new(src).canonicalize().unwrap();
+        let dest_path = output.join(dst);
         info!(
             "Copy: {:?} -> {dest_path:?}",
             file.strip_prefix(root).unwrap()
@@ -184,6 +190,7 @@ fn unfeature_crate(
         "LICENSE",
         "build.rs",
         "rust-toolchain",
+        "rust-toolchain.toml",
         "rustfmt.toml",
         ".gitignore",
         ".cargo/config.toml",
